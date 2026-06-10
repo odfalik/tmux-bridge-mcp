@@ -16,6 +16,10 @@ import * as bridge from "../tmux-bridge.js";
 const execFileAsync = promisify(execFile);
 
 const SESSION = "tmux-bridge-test";
+const LABEL_PREFIX = `bridge-test-${Date.now()}`;
+const CLAUDE_LABEL = `${LABEL_PREFIX}-claude`;
+const CODEX_LABEL = `${LABEL_PREFIX}-codex`;
+const KIMI_LABEL = `${LABEL_PREFIX}-kimi`;
 let paneIds: string[] = [];
 
 // Synchronous check — needed because describe.skipIf runs before beforeAll
@@ -57,44 +61,48 @@ beforeAll(async () => {
     // OK if it doesn't exist
   }
 
-  // Create a new session with 3 panes (simulating 3 agents)
-  await tmux("new-session", "-d", "-s", SESSION, "-x", "200", "-y", "50");
-
-  // Pane 0 = "claude" — run a simple shell
+  // Create a new session with 3 panes (simulating 3 agents).
+  // Capture pane IDs directly so the test works with custom base-index values.
   const pane0 = await tmux(
-    "display-message",
-    "-t",
-    `${SESSION}:0.0`,
-    "-p",
+    "new-session",
+    "-d",
+    "-s",
+    SESSION,
+    "-x",
+    "200",
+    "-y",
+    "50",
+    "-P",
+    "-F",
     "#{pane_id}"
   );
 
-  // Split to create pane 1 = "codex"
-  await tmux("split-window", "-h", "-t", `${SESSION}:0`);
   const pane1 = await tmux(
-    "display-message",
+    "split-window",
+    "-h",
     "-t",
-    `${SESSION}:0.1`,
-    "-p",
+    pane0,
+    "-P",
+    "-F",
     "#{pane_id}"
   );
 
-  // Split to create pane 2 = "kimi"
-  await tmux("split-window", "-v", "-t", `${SESSION}:0.1`);
   const pane2 = await tmux(
-    "display-message",
+    "split-window",
+    "-v",
     "-t",
-    `${SESSION}:0.2`,
-    "-p",
+    pane1,
+    "-P",
+    "-F",
     "#{pane_id}"
   );
 
   paneIds = [pane0, pane1, pane2];
 
   // Label the panes
-  await tmux("set-option", "-p", "-t", pane0, "@name", "claude");
-  await tmux("set-option", "-p", "-t", pane1, "@name", "codex");
-  await tmux("set-option", "-p", "-t", pane2, "@name", "kimi");
+  await tmux("set-option", "-p", "-t", pane0, "@name", CLAUDE_LABEL);
+  await tmux("set-option", "-p", "-t", pane1, "@name", CODEX_LABEL);
+  await tmux("set-option", "-p", "-t", pane2, "@name", KIMI_LABEL);
 
   // Give panes time to initialize
   await sleep(500);
@@ -132,7 +140,7 @@ describe.skipIf(!tmuxAvailable)("Integration: tmux cross-pane", () => {
       .filter((p) => paneIds.includes(p.target))
       .map((p) => p.label)
       .sort();
-    expect(labels).toEqual(["claude", "codex", "kimi"]);
+    expect(labels).toEqual([CLAUDE_LABEL, CODEX_LABEL, KIMI_LABEL].sort());
   });
 
   it("should read pane content", async () => {
@@ -143,24 +151,24 @@ describe.skipIf(!tmuxAvailable)("Integration: tmux cross-pane", () => {
   });
 
   it("should resolve label to pane ID", async () => {
-    const resolved = await bridge.resolve("claude");
+    const resolved = await bridge.resolve(CLAUDE_LABEL);
     expect(resolved).toBe(paneIds[0]);
 
-    const resolved2 = await bridge.resolve("codex");
+    const resolved2 = await bridge.resolve(CODEX_LABEL);
     expect(resolved2).toBe(paneIds[1]);
 
-    const resolved3 = await bridge.resolve("kimi");
+    const resolved3 = await bridge.resolve(KIMI_LABEL);
     expect(resolved3).toBe(paneIds[2]);
   });
 
   it("should throw for unknown label", async () => {
     await expect(bridge.resolve("nonexistent")).rejects.toThrow(
-      "No pane found with label"
+      "No live pane found with window name or label"
     );
   });
 
   it("should read by label (not just pane ID)", async () => {
-    const content = await bridge.read("codex", 5);
+    const content = await bridge.read(CODEX_LABEL, 5);
     expect(typeof content).toBe("string");
   });
 
@@ -194,22 +202,22 @@ describe.skipIf(!tmuxAvailable)("Integration: tmux cross-pane", () => {
 
   it("should type from claude pane into codex pane", async () => {
     // Simulate: Claude typing into Codex's pane
-    await bridge.read("codex", 5);
-    await bridge.type("codex", "echo cross_pane_works");
-    await bridge.read("codex", 5);
-    await bridge.keys("codex", "Enter");
+    await bridge.read(CODEX_LABEL, 5);
+    await bridge.type(CODEX_LABEL, "echo cross_pane_works");
+    await bridge.read(CODEX_LABEL, 5);
+    await bridge.keys(CODEX_LABEL, "Enter");
     await sleep(300);
-    const output = await bridge.read("codex", 10);
+    const output = await bridge.read(CODEX_LABEL, 10);
     expect(output).toContain("cross_pane_works");
   });
 
   it("should type from codex pane into kimi pane", async () => {
-    await bridge.read("kimi", 5);
-    await bridge.type("kimi", "echo codex_to_kimi");
-    await bridge.read("kimi", 5);
-    await bridge.keys("kimi", "Enter");
+    await bridge.read(KIMI_LABEL, 5);
+    await bridge.type(KIMI_LABEL, "echo codex_to_kimi");
+    await bridge.read(KIMI_LABEL, 5);
+    await bridge.keys(KIMI_LABEL, "Enter");
     await sleep(300);
-    const output = await bridge.read("kimi", 10);
+    const output = await bridge.read(KIMI_LABEL, 10);
     expect(output).toContain("codex_to_kimi");
   });
 
@@ -219,7 +227,7 @@ describe.skipIf(!tmuxAvailable)("Integration: tmux cross-pane", () => {
     expect(resolved).toBe(paneIds[0]);
 
     // Restore original label
-    await bridge.name(paneIds[0], "claude");
+    await bridge.name(paneIds[0], CLAUDE_LABEL);
   });
 
   it("should handle doctor command", async () => {
@@ -230,20 +238,20 @@ describe.skipIf(!tmuxAvailable)("Integration: tmux cross-pane", () => {
 
   it("should read multiple panes independently", async () => {
     // Type different content into each pane
-    await bridge.read("claude", 5);
-    await bridge.type("claude", "echo pane_claude_unique");
-    await bridge.read("claude", 5);
-    await bridge.keys("claude", "Enter");
+    await bridge.read(CLAUDE_LABEL, 5);
+    await bridge.type(CLAUDE_LABEL, "echo pane_claude_unique");
+    await bridge.read(CLAUDE_LABEL, 5);
+    await bridge.keys(CLAUDE_LABEL, "Enter");
 
-    await bridge.read("kimi", 5);
-    await bridge.type("kimi", "echo pane_kimi_unique");
-    await bridge.read("kimi", 5);
-    await bridge.keys("kimi", "Enter");
+    await bridge.read(KIMI_LABEL, 5);
+    await bridge.type(KIMI_LABEL, "echo pane_kimi_unique");
+    await bridge.read(KIMI_LABEL, 5);
+    await bridge.keys(KIMI_LABEL, "Enter");
 
     await sleep(300);
 
-    const claudeOutput = await bridge.read("claude", 10);
-    const kimiOutput = await bridge.read("kimi", 10);
+    const claudeOutput = await bridge.read(CLAUDE_LABEL, 10);
+    const kimiOutput = await bridge.read(KIMI_LABEL, 10);
 
     expect(claudeOutput).toContain("pane_claude_unique");
     expect(kimiOutput).toContain("pane_kimi_unique");

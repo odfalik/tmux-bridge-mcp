@@ -38,9 +38,9 @@ server.tool(
 
 server.tool(
   "tmux_read",
-  "Read the last N lines from a tmux pane. Must be called before type/keys (read guard). Target can be a pane ID (%N), session:window.pane, or a label.",
+  "Read the last N lines from a tmux pane. Must be called before type/keys (read guard). Target can be a pane ID (%N), session:window.pane, window name, or label. Names resolve globally by tmux window name first.",
   {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
+    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
     lines: z
       .number()
       .optional()
@@ -61,7 +61,7 @@ server.tool(
   "tmux_type",
   "Type text into a tmux pane WITHOUT pressing Enter. You must tmux_read the pane first (read guard enforced). After typing, use tmux_read to verify, then tmux_keys to press Enter.",
   {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
+    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
     text: z.string().describe("Text to type into the pane"),
   },
   async ({ target, text }) => {
@@ -78,7 +78,7 @@ server.tool(
   "tmux_message",
   "Send a message to another agent's pane with auto-prepended sender info, reply target, and correlation ID. Cannot message your own pane (loop prevention). Must tmux_read first.",
   {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
+    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
     text: z.string().describe("Message to send"),
   },
   async ({ target, text }) => {
@@ -97,7 +97,7 @@ server.tool(
   "tmux_keys",
   "Send special keys to a tmux pane (Enter, Escape, C-c, etc.). Must tmux_read first.",
   {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, or label"),
+    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
     keys: z
       .array(z.string())
       .describe('Keys to send, e.g. ["Enter"], ["Escape"], ["C-c"]'),
@@ -137,9 +137,9 @@ server.tool(
 
 server.tool(
   "tmux_resolve",
-  "Look up a pane's target ID by its label",
+  "Look up a pane's target ID by canonical tmux window name or legacy label",
   {
-    label: z.string().describe("Label to resolve"),
+    label: z.string().describe("Window name or legacy label to resolve"),
   },
   async ({ label }) => {
     try {

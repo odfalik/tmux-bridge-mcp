@@ -45,7 +45,7 @@ Once installed, your AI agents can:
 | **Send a task to another agent** | `tmux_message` + `tmux_keys` | Tell Claude to review a file |
 | **Coordinate multi-agent workflows** | Chain tool calls | Gemini researches -> Claude implements -> Codex reviews |
 | **Monitor processes** | `tmux_read` on a shell pane | Watch build logs, test output, server status |
-| **Label panes by role** | `tmux_name` | Name panes "claude", "codex", "gemini" for easy targeting |
+| **Route by tmux window** | `tmux_read` / `tmux_message` | Address agents by canonical tmux window names like "training" or "lit-review" |
 
 All of this happens through standard MCP tool calls -- your agent doesn't need to learn any new syntax. If it supports MCP, it already knows how.
 
@@ -316,12 +316,12 @@ kimi-tmux --rounds 3 "send a message to gemini and wait for the result"
 | `tmux_type` | Type text into a pane without pressing Enter (requires prior read) |
 | `tmux_message` | Send message with auto-prepended sender info (requires prior read) |
 | `tmux_keys` | Send special keys -- Enter, Escape, C-c, etc. (requires prior read) |
-| `tmux_name` | Label a pane for easy targeting (e.g., "claude", "gemini") |
-| `tmux_resolve` | Look up pane ID by label |
+| `tmux_name` | Set a legacy pane label for easy targeting (e.g., "claude", "gemini") |
+| `tmux_resolve` | Look up pane ID by tmux window name or legacy label |
 | `tmux_id` | Print current pane's tmux ID |
 | `tmux_doctor` | Diagnose tmux connectivity issues |
 
-Targets can be a pane ID (`%0`), session:window.pane (`main:0.1`), or a label (`claude`).
+Targets can be a pane ID (`%0`), session:window.pane (`main:0.1`), a tmux window name (`lit-review`), or a legacy pane label (`claude`). Non-explicit names resolve globally by `#{window_name}` first, then `@name` labels. Duplicate grouped-session views are collapsed by `#{pane_id}`; multiple real panes with the same name return an ambiguity error with candidates.
 
 ## 📖 Examples
 

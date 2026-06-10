@@ -39,14 +39,17 @@ You have access to tmux-bridge MCP tools for communicating with other AI agents 
 | `tmux_type` | Type text without Enter (requires prior read) |
 | `tmux_message` | Type message with auto sender info (requires prior read) |
 | `tmux_keys` | Send special keys: Enter, Escape, C-c, etc. (requires prior read) |
-| `tmux_name` | Label a pane for easy targeting |
-| `tmux_resolve` | Look up pane ID by label |
+| `tmux_name` | Set a legacy pane label for easy targeting |
+| `tmux_resolve` | Look up pane ID by tmux window name or legacy label |
 | `tmux_id` | Print current pane's tmux ID |
 | `tmux_doctor` | Diagnose tmux connection issues |
+
+Targets can be explicit tmux targets (`%pane_id`, `session:window.pane`, or window index) or names. Resolve names globally by canonical tmux `#{window_name}` first, then legacy `@name` labels. If the same pane appears through multiple grouped sessions, treat it as one candidate by `#{pane_id}`; if multiple real panes match, stop and report the ambiguity.
 
 ## Target Resolution
 
 Targets can be:
 - **Pane ID**: `%0`, `%3` (from tmux_list)
 - **Session:window.pane**: `main:0.1`
-- **Label**: `claude`, `gemini` (set via tmux_name)
+- **Window name**: `training`, `lit-review`, `paper-intelligence`
+- **Legacy label**: `claude`, `gemini` (set via tmux_name)

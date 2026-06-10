@@ -89,31 +89,117 @@ async function tmuxNoFail(...args: string[]): Promise<string> {
 }
 
 // --- Target Resolution ---
-// Supports: pane ID (%N), session:win.pane, label (@name), or pure number (window index)
+// Supports explicit tmux targets (pane ID, session:win.pane, window index).
+// Non-explicit targets resolve globally by tmux window name first, then legacy
+// @name labels. Grouped sessions can list the same pane more than once, so
+// candidate matching deduplicates by pane ID before deciding uniqueness.
+
+export interface TmuxPaneRecord {
+  paneId: string;
+  sessionName: string;
+  windowIndex: string;
+  windowName: string;
+  paneIndex: string;
+  paneDead: string;
+  command: string;
+  label: string;
+  cwd: string;
+}
+
+const LIST_PANES_FORMAT =
+  "#{pane_id}|#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{@name}|#{pane_current_path}";
+
+function isExplicitTmuxTarget(target: string): boolean {
+  if (/^%\d+$/.test(target)) return true;
+  if (target.includes(":") || target.includes(".")) return true;
+  return /^\d+$/.test(target);
+}
+
+export function parsePaneRecords(output: string): TmuxPaneRecord[] {
+  return output
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [
+        paneId,
+        sessionName,
+        windowIndex,
+        windowName,
+        paneIndex,
+        paneDead,
+        command,
+        label,
+        cwd,
+      ] = line.split("|");
+
+      return {
+        paneId,
+        sessionName,
+        windowIndex,
+        windowName,
+        paneIndex,
+        paneDead,
+        command,
+        label,
+        cwd,
+      };
+    });
+}
+
+function dedupeLivePanes(panes: TmuxPaneRecord[]): TmuxPaneRecord[] {
+  const byPaneId = new Map<string, TmuxPaneRecord>();
+  for (const pane of panes) {
+    if (!pane.paneId || pane.paneDead === "1") continue;
+    if (!byPaneId.has(pane.paneId)) {
+      byPaneId.set(pane.paneId, pane);
+    }
+  }
+  return [...byPaneId.values()];
+}
+
+function candidateLine(pane: TmuxPaneRecord): string {
+  const sessionTarget = `${pane.sessionName}:${pane.windowIndex}.${pane.paneIndex}`;
+  return [
+    pane.paneId,
+    sessionTarget,
+    `window:${pane.windowName || "(none)"}`,
+    `process:${pane.command || "?"}`,
+    `label:${pane.label || "(none)"}`,
+  ].join(" | ");
+}
+
+export function resolvePaneFromRecords(
+  target: string,
+  records: TmuxPaneRecord[]
+): string {
+  const panes = dedupeLivePanes(records);
+
+  for (const [field, name] of [
+    ["windowName", "window name"],
+    ["label", "label"],
+  ] as const) {
+    const matches = panes.filter((pane) => pane[field] === target);
+    if (matches.length === 1) return matches[0].paneId;
+    if (matches.length > 1) {
+      const candidates = matches.map(candidateLine).join("\n");
+      throw new Error(
+        `Ambiguous tmux ${name} '${target}' matched multiple live panes:\n${candidates}`
+      );
+    }
+  }
+
+  throw new Error(`No live pane found with window name or label '${target}'`);
+}
+
+async function listPaneRecords(): Promise<TmuxPaneRecord[]> {
+  const output = await tmux("list-panes", "-a", "-F", LIST_PANES_FORMAT);
+  return parsePaneRecords(output);
+}
 
 async function resolveTarget(target: string): Promise<string> {
-  // tmux pane ID like %0, %12
-  if (/^%\d+$/.test(target)) return target;
-
-  // session:win.pane or has dot
-  if (target.includes(":") || target.includes(".")) return target;
-
-  // Pure numeric — treat as window index
-  if (/^\d+$/.test(target)) return target;
-
-  // Otherwise resolve as @name label
-  const output = await tmux(
-    "list-panes",
-    "-a",
-    "-F",
-    "#{pane_id} #{@name}"
-  );
-  for (const line of output.trim().split("\n")) {
-    const [paneId, ...labelParts] = line.split(" ");
-    const label = labelParts.join(" ");
-    if (label === target) return paneId;
-  }
-  throw new Error(`No pane found with label '${target}'`);
+  if (isExplicitTmuxTarget(target)) return target;
+  return resolvePaneFromRecords(target, await listPaneRecords());
 }
 
 async function validateTarget(target: string): Promise<void> {
@@ -163,7 +249,7 @@ export async function list(): Promise<PaneInfo[]> {
     "list-panes",
     "-a",
     "-F",
-    "#{pane_id}|#{session_name}:#{window_index}|#{pane_width}x#{pane_height}|#{pane_current_command}|#{@name}|#{pane_current_path}"
+    `${LIST_PANES_FORMAT}|#{pane_width}x#{pane_height}`
   );
 
   return output
@@ -171,12 +257,23 @@ export async function list(): Promise<PaneInfo[]> {
     .split("\n")
     .filter(Boolean)
     .map((line) => {
-      const [target, sessionWindow, size, cmd, label, cwd] =
+      const [
+        target,
+        sessionName,
+        windowIndex,
+        _windowName,
+        _paneIndex,
+        _paneDead,
+        cmd,
+        label,
+        cwd,
+        size,
+      ] =
         line.split("|");
       const home = process.env.HOME || "";
       return {
         target,
-        sessionWindow,
+        sessionWindow: `${sessionName}:${windowIndex}`,
         size,
         process: cmd || "?",
         label: label || "",
@@ -265,17 +362,7 @@ export async function name(target: string, label: string): Promise<void> {
 }
 
 export async function resolve(label: string): Promise<string> {
-  const output = await tmux(
-    "list-panes",
-    "-a",
-    "-F",
-    "#{pane_id} #{@name}"
-  );
-  for (const line of output.trim().split("\n")) {
-    const [paneId, ...labelParts] = line.split(" ");
-    if (labelParts.join(" ") === label) return paneId;
-  }
-  throw new Error(`No pane found with label '${label}'`);
+  return resolveTarget(label);
 }
 
 export async function id(): Promise<string> {
