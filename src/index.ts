@@ -153,7 +153,7 @@ server.tool(
 
 server.tool(
   "tmux_id",
-  "Print the current pane's tmux ID ($TMUX_PANE). Useful for self-identification when labeling.",
+  "Print the MCP server's current tmux pane ID. Uses $TMUX_PANE when available, otherwise resolves by process ancestry against tmux pane PIDs.",
   {},
   async () => {
     try {

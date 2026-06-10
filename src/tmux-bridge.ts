@@ -221,10 +221,132 @@ async function getPaneId(target: string): Promise<string> {
   return output.trim();
 }
 
+export interface SelfPaneRecord {
+  paneId: string;
+  panePid: string;
+  paneDead: string;
+  windowName: string;
+  label: string;
+  command: string;
+}
+
+export function parseSelfPaneRecords(output: string): SelfPaneRecord[] {
+  return output
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [paneId, panePid, paneDead, windowName, label, command] =
+        line.split("|");
+      return { paneId, panePid, paneDead, windowName, label, command };
+    });
+}
+
+export async function processAncestry(startPid: number = process.pid): Promise<string[]> {
+  const pids: string[] = [];
+  const seen = new Set<string>();
+  let pid = String(startPid);
+
+  for (let depth = 0; depth < 64 && pid && pid !== "1" && !seen.has(pid); depth++) {
+    pids.push(pid);
+    seen.add(pid);
+
+    try {
+      const { stdout } = await execFileAsync("ps", ["-o", "ppid=", "-p", pid], {
+        timeout: 2_000,
+      });
+      pid = stdout.trim();
+    } catch {
+      break;
+    }
+  }
+
+  return pids;
+}
+
+export function selfPaneFromRecords(
+  records: SelfPaneRecord[],
+  ancestry: string[]
+): string {
+  const ancestorPids = new Set(ancestry);
+  const matches = new Map<string, SelfPaneRecord>();
+
+  for (const record of records) {
+    if (!record.paneId || record.paneDead === "1") continue;
+    if (!ancestorPids.has(record.panePid)) continue;
+    if (!matches.has(record.paneId)) {
+      matches.set(record.paneId, record);
+    }
+  }
+
+  if (matches.size === 0) {
+    throw new Error(
+      "Unable to determine current tmux pane: no live pane_pid matched process ancestry"
+    );
+  }
+  if (matches.size > 1) {
+    const candidates = [...matches.values()]
+      .map((record) =>
+        [
+          record.paneId,
+          `pid:${record.panePid || "?"}`,
+          `window:${record.windowName || "(none)"}`,
+          `process:${record.command || "?"}`,
+          `label:${record.label || "(none)"}`,
+        ].join(" | ")
+      )
+      .join("\n");
+    throw new Error(
+      `Unable to determine current tmux pane: process ancestry matched multiple live panes:\n${candidates}`
+    );
+  }
+
+  return [...matches.keys()][0];
+}
+
+async function envSelfPane(): Promise<string | undefined> {
+  const pane = process.env.TMUX_PANE;
+  if (!pane) return undefined;
+
+  try {
+    const visiblePane = await getPaneId(pane);
+    return visiblePane === pane ? pane : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function detectSelfPane(): Promise<string> {
+  const fromEnv = await envSelfPane();
+  if (fromEnv) return fromEnv;
+
+  const records = parseSelfPaneRecords(
+    await tmux(
+      "list-panes",
+      "-a",
+      "-F",
+      "#{pane_id}|#{pane_pid}|#{pane_dead}|#{window_name}|#{@name}|#{pane_current_command}"
+    )
+  );
+  return selfPaneFromRecords(records, await processAncestry());
+}
+
+async function detectSelfPaneNoFail(): Promise<string | undefined> {
+  try {
+    return await detectSelfPane();
+  } catch {
+    return undefined;
+  }
+}
+
+async function requireSelfPane(): Promise<string> {
+  return detectSelfPane();
+}
+
 // --- Loop Prevention ---
 
-function assertNotSelf(paneId: string, action: string): void {
-  const self = process.env.TMUX_PANE;
+async function assertNotSelf(paneId: string, action: string): Promise<void> {
+  const self = await detectSelfPaneNoFail();
   if (self && paneId === self) {
     if (action === "message") {
       throw new Error("Cannot send message to your own pane (loop prevention)");
@@ -305,7 +427,7 @@ export async function type(target: string, text: string): Promise<void> {
   const resolved = await resolveTarget(target);
   await validateTarget(resolved);
   const paneId = await getPaneId(resolved);
-  assertNotSelf(paneId, "type");
+  await assertNotSelf(paneId, "type");
   requireRead(paneId);
 
   await tmux("send-keys", "-t", resolved, "-l", "--", text);
@@ -319,22 +441,28 @@ export async function message(
   const resolved = await resolveTarget(target);
   await validateTarget(resolved);
   const paneId = await getPaneId(resolved);
-  assertNotSelf(paneId, "message");
+  await assertNotSelf(paneId, "message");
   requireRead(paneId);
 
   // Detect sender identity
-  const senderPane = process.env.TMUX_PANE || "unknown";
-  const senderLabel = await tmuxNoFail(
-    "display-message",
-    "-t",
-    senderPane,
-    "-p",
-    "#{@name}"
-  );
-  const from = senderLabel.trim() || senderPane;
+  const senderPane = await detectSelfPaneNoFail();
+  const senderName = senderPane
+    ? await tmuxNoFail(
+        "display-message",
+        "-t",
+        senderPane,
+        "-p",
+        "#{window_name}"
+      )
+    : "";
+  const senderLabel = senderPane
+    ? await tmuxNoFail("display-message", "-t", senderPane, "-p", "#{@name}")
+    : "";
+  const paneForHeader = senderPane || "unknown";
+  const from = senderName.trim() || senderLabel.trim() || paneForHeader;
 
   const correlationId = randomUUID().slice(0, 8);
-  const header = `[tmux-bridge from:${from} pane:${senderPane} id:${correlationId}]`;
+  const header = `[tmux-bridge from:${from} pane:${paneForHeader} id:${correlationId}]`;
   await tmux("send-keys", "-t", resolved, "-l", "--", `${header} ${text}`);
   clearRead(paneId);
 }
@@ -346,7 +474,7 @@ export async function keys(
   const resolved = await resolveTarget(target);
   await validateTarget(resolved);
   const paneId = await getPaneId(resolved);
-  assertNotSelf(paneId, "keys");
+  await assertNotSelf(paneId, "keys");
   requireRead(paneId);
 
   for (const key of keyList) {
@@ -366,9 +494,7 @@ export async function resolve(label: string): Promise<string> {
 }
 
 export async function id(): Promise<string> {
-  const pane = process.env.TMUX_PANE;
-  if (!pane) throw new Error("Not running inside a tmux pane ($TMUX_PANE is unset)");
-  return pane;
+  return requireSelfPane();
 }
 
 // --- Sensible Defaults ---
@@ -460,6 +586,10 @@ export async function doctor(): Promise<string> {
       lines.push(`This pane (${pane}):  NOT visible to server`);
     }
   }
+
+  const detectedPane = await detectSelfPaneNoFail();
+  lines.push(`Detected self pane: ${detectedPane || "<unknown>"}`);
+  if (!detectedPane) hasErrors = true;
 
   // Show applied defaults
   lines.push("---");

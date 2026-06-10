@@ -5,6 +5,8 @@ import {
   clearRead,
   parsePaneRecords,
   resolvePaneFromRecords,
+  parseSelfPaneRecords,
+  selfPaneFromRecords,
 } from "../tmux-bridge.js";
 
 // Use a unique pane ID per test run to avoid collisions
@@ -94,6 +96,52 @@ describe("window-name resolver", () => {
   it("throws a not-found error when neither window name nor label matches", () => {
     expect(() => resolvePaneFromRecords("missing", records)).toThrow(
       /No live pane found with window name or label 'missing'/
+    );
+  });
+});
+
+describe("self-pane resolver", () => {
+  it("matches one live pane by process ancestry", () => {
+    const records = parseSelfPaneRecords(
+      [
+        "%10|100|0|training||zsh",
+        "%11|200|0|lit-review||codex",
+        "%12|300|1|dead-pane||zsh",
+      ].join("\n")
+    );
+
+    expect(selfPaneFromRecords(records, ["42", "200", "1"])).toBe("%11");
+  });
+
+  it("deduplicates grouped-session views by pane ID", () => {
+    const records = parseSelfPaneRecords(
+      [
+        "%10|100|0|training||zsh",
+        "%10|100|0|training||zsh",
+      ].join("\n")
+    );
+
+    expect(selfPaneFromRecords(records, ["100"])).toBe("%10");
+  });
+
+  it("ignores dead panes", () => {
+    const records = parseSelfPaneRecords("%10|100|1|training||zsh");
+
+    expect(() => selfPaneFromRecords(records, ["100"])).toThrow(
+      /no live pane_pid matched process ancestry/
+    );
+  });
+
+  it("throws for ambiguous ancestry matches", () => {
+    const records = parseSelfPaneRecords(
+      [
+        "%10|100|0|training||zsh",
+        "%11|200|0|lit-review||codex",
+      ].join("\n")
+    );
+
+    expect(() => selfPaneFromRecords(records, ["100", "200"])).toThrow(
+      /process ancestry matched multiple live panes/
     );
   });
 });
