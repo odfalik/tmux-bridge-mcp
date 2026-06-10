@@ -264,17 +264,13 @@ Add to your project's `.mcp.json` or global MCP config:
 
 ### Codex (native MCP)
 
-Add to your MCP config following the Codex MCP setup docs:
+Add to `~/.codex/config.toml`. Pass through `TMUX` and `TMUX_PANE` so tmux-bridge can identify the calling pane reliably; if these are absent, tmux-bridge falls back to process ancestry against `#{pane_pid}`.
 
-```json
-{
-  "mcpServers": {
-    "tmux-bridge": {
-      "command": "npx",
-      "args": ["tmux-bridge-mcp"]
-    }
-  }
-}
+```toml
+[mcp_servers.tmux-bridge]
+command = "npx"
+args = ["tmux-bridge-mcp"]
+env_vars = ["TMUX", "TMUX_PANE"]
 ```
 
 ### Kimi CLI
