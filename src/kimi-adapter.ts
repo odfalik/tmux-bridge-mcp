@@ -3,7 +3,7 @@
  * kimi-adapter — Bridges Kimi CLI to tmux-bridge via text-based tool call parsing.
  *
  * Kimi CLI doesn't support MCP natively. This adapter:
- * 1. Injects the smux system instruction into Kimi's prompt
+ * 1. Injects the tmux-bridge system instruction into Kimi's prompt
  * 2. Runs Kimi in --print mode
  * 3. Parses tool call blocks from Kimi's output (JSON preferred, function-call fallback)
  * 4. Executes them via tmux-bridge CLI
@@ -154,35 +154,20 @@ async function executeToolCall(call: ToolCall): Promise<string> {
       case "tmux_list": {
         const panes = await bridge.list();
         return panes
-          .map((p) => `${p.target} | ${p.sessionWindow} | ${p.process} | label:${p.label || "(none)"} | ${p.cwd}`)
+          .map((p) => `${p.target} | ${p.sessionWindow} | window:${p.windowName || "(none)"} | ${p.process} | ${p.cwd}`)
           .join("\n") || "(no panes)";
       }
       case "tmux_read":
         if (!args.target) return "Error: tmux_read requires 'target' argument";
         return await bridge.read(String(args.target), Number(args.lines) || 50);
-      case "tmux_type":
-        if (!args.target) return "Error: tmux_type requires 'target' argument";
-        if (args.text == null) return "Error: tmux_type requires 'text' argument";
-        await bridge.type(String(args.target), String(args.text));
-        return `Typed into ${args.target}`;
       case "tmux_message":
         if (!args.target) return "Error: tmux_message requires 'target' argument";
         if (args.text == null) return "Error: tmux_message requires 'text' argument";
         await bridge.message(String(args.target), String(args.text));
-        return `Message sent to ${args.target}`;
-      case "tmux_keys":
-        if (!args.target) return "Error: tmux_keys requires 'target' argument";
-        if (!Array.isArray(args.keys) || args.keys.length === 0) return "Error: tmux_keys requires 'keys' array argument";
-        await bridge.keys(String(args.target), ...args.keys.map(String));
-        return `Sent keys to ${args.target}`;
-      case "tmux_name":
-        if (!args.target) return "Error: tmux_name requires 'target' argument";
-        if (!args.label) return "Error: tmux_name requires 'label' argument";
-        await bridge.name(String(args.target), String(args.label));
-        return `Labeled ${args.target} as "${args.label}"`;
+        return `Message sent and submitted to ${args.target}`;
       case "tmux_resolve":
-        if (!args.label) return "Error: tmux_resolve requires 'label' argument";
-        return await bridge.resolve(String(args.label));
+        if (!args.target && !args.label) return "Error: tmux_resolve requires 'target' argument";
+        return await bridge.resolve(String(args.target || args.label));
       case "tmux_id":
         return await bridge.id();
       case "tmux_doctor":
@@ -200,9 +185,9 @@ async function executeToolCall(call: ToolCall): Promise<string> {
 async function loadSystemInstruction(): Promise<string> {
   const thisDir = dirname(fileURLToPath(import.meta.url));
   try {
-    return await readFile(join(thisDir, "../system-instruction/smux-skill.md"), "utf-8");
+    return await readFile(join(thisDir, "../system-instruction/tmux-bridge-skill.md"), "utf-8");
   } catch {
-    process.stderr.write("Warning: could not load system-instruction/smux-skill.md\n");
+    process.stderr.write("Warning: could not load system-instruction/tmux-bridge-skill.md\n");
     return "";
   }
 }

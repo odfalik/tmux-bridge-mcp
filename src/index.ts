@@ -18,7 +18,7 @@ export function err(e: unknown): { content: Array<{ type: "text"; text: string }
 
 server.tool(
   "tmux_list",
-  "List all tmux panes with target ID, process, label, and working directory",
+  "List all tmux panes with target ID, window name, process, and working directory",
   {},
   async () => {
     try {
@@ -26,7 +26,7 @@ server.tool(
       const text = panes
         .map(
           (p) =>
-            `${p.target} | ${p.sessionWindow} | ${p.process} | label:${p.label || "(none)"} | ${p.cwd}`
+            `${p.target} | ${p.sessionWindow} | window:${p.windowName || "(none)"} | ${p.process} | ${p.cwd}`
         )
         .join("\n");
       return { content: [{ type: "text", text: text || "No panes found" }] };
@@ -38,9 +38,9 @@ server.tool(
 
 server.tool(
   "tmux_read",
-  "Read the last N lines from a tmux pane. Must be called before type/keys (read guard). Target can be a pane ID (%N), session:window.pane, window name, or label. Names resolve globally by tmux window name first.",
+  "Read the last N lines from a tmux pane. Must be called before tmux_message (read guard). Target can be a pane ID (%N), session:window.pane, or window name. Names resolve globally by tmux window name.",
   {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
+    target: z.string().describe("Pane target: ID (%0), session:win.pane, or window name"),
     lines: z
       .number()
       .optional()
@@ -58,76 +58,17 @@ server.tool(
 );
 
 server.tool(
-  "tmux_type",
-  "Type text into a tmux pane WITHOUT pressing Enter. You must tmux_read the pane first (read guard enforced). After typing, use tmux_read to verify, then tmux_keys to press Enter.",
-  {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
-    text: z.string().describe("Text to type into the pane"),
-  },
-  async ({ target, text }) => {
-    try {
-      await bridge.type(target, text);
-      return { content: [{ type: "text", text: `Typed into ${target}` }] };
-    } catch (e) {
-      return err(e);
-    }
-  }
-);
-
-server.tool(
   "tmux_message",
-  "Send a message to another agent's pane with auto-prepended sender info, reply target, and correlation ID. Cannot message your own pane (loop prevention). Must tmux_read first.",
+  "Send and submit a message to another agent's pane with auto-prepended sender info, reply target, and correlation ID. Presses Enter automatically. Cannot message your own pane (loop prevention). Must tmux_read first.",
   {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
+    target: z.string().describe("Pane target: ID (%0), session:win.pane, or window name"),
     text: z.string().describe("Message to send"),
   },
   async ({ target, text }) => {
     try {
       await bridge.message(target, text);
       return {
-        content: [{ type: "text", text: `Message sent to ${target}` }],
-      };
-    } catch (e) {
-      return err(e);
-    }
-  }
-);
-
-server.tool(
-  "tmux_keys",
-  "Send special keys to a tmux pane (Enter, Escape, C-c, etc.). Must tmux_read first.",
-  {
-    target: z.string().describe("Pane target: ID (%0), session:win.pane, window name, or label"),
-    keys: z
-      .array(z.string())
-      .describe('Keys to send, e.g. ["Enter"], ["Escape"], ["C-c"]'),
-  },
-  async ({ target, keys }) => {
-    try {
-      await bridge.keys(target, ...keys);
-      return {
-        content: [
-          { type: "text", text: `Sent keys [${keys.join(", ")}] to ${target}` },
-        ],
-      };
-    } catch (e) {
-      return err(e);
-    }
-  }
-);
-
-server.tool(
-  "tmux_name",
-  "Label a tmux pane for easy addressing (e.g., 'gemini', 'claude'). The label appears in the tmux border.",
-  {
-    target: z.string().describe("Pane target: ID (%0) or session:win.pane"),
-    label: z.string().describe("Label to assign"),
-  },
-  async ({ target, label }) => {
-    try {
-      await bridge.name(target, label);
-      return {
-        content: [{ type: "text", text: `Labeled ${target} as "${label}"` }],
+        content: [{ type: "text", text: `Message sent and submitted to ${target}` }],
       };
     } catch (e) {
       return err(e);
@@ -137,14 +78,14 @@ server.tool(
 
 server.tool(
   "tmux_resolve",
-  "Look up a pane's target ID by canonical tmux window name or legacy label",
+  "Look up a pane's target ID by canonical tmux window name",
   {
-    label: z.string().describe("Window name or legacy label to resolve"),
+    target: z.string().describe("Window name to resolve"),
   },
-  async ({ label }) => {
+  async ({ target }) => {
     try {
-      const target = await bridge.resolve(label);
-      return { content: [{ type: "text", text: target }] };
+      const paneId = await bridge.resolve(target);
+      return { content: [{ type: "text", text: paneId }] };
     } catch (e) {
       return err(e);
     }

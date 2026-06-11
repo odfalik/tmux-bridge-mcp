@@ -1,6 +1,6 @@
 /**
  * tmux-bridge core — direct tmux interaction via child_process.
- * No external CLI dependencies (no smux, no tmux-bridge CLI).
+ * No external CLI dependencies (no tmux-bridge CLI).
  * Only requires `tmux` to be installed.
  */
 import { execFile } from "node:child_process";
@@ -86,6 +86,12 @@ async function tmuxNoFail(...args: string[]): Promise<string> {
   } catch {
     return "";
   }
+}
+
+function writeTempText(prefix: string, text: string): string {
+  const path = join(tmpdir(), `${prefix}-${randomUUID()}`);
+  writeFileSync(path, text);
+  return path;
 }
 
 // --- Target Resolution ---
@@ -360,6 +366,7 @@ async function assertNotSelf(paneId: string, action: string): Promise<void> {
 export interface PaneInfo {
   target: string;
   sessionWindow: string;
+  windowName: string;
   size: string;
   process: string;
   label: string;
@@ -396,6 +403,7 @@ export async function list(): Promise<PaneInfo[]> {
       return {
         target,
         sessionWindow: `${sessionName}:${windowIndex}`,
+        windowName: _windowName || "",
         size,
         process: cmd || "?",
         label: label || "",
@@ -463,7 +471,27 @@ export async function message(
 
   const correlationId = randomUUID().slice(0, 8);
   const header = `[tmux-bridge from:${from} pane:${paneForHeader} id:${correlationId}]`;
-  await tmux("send-keys", "-t", resolved, "-l", "--", `${header} ${text}`);
+  const bufferName = `tmux-bridge-${correlationId}`;
+  const tmpPath = writeTempText("tmux-bridge-message", `${header} ${text}`);
+
+  try {
+    await tmux("load-buffer", "-b", bufferName, tmpPath);
+    await tmux(
+      "paste-buffer",
+      "-d",
+      "-b",
+      bufferName,
+      "-t",
+      resolved,
+    );
+    await tmux("send-keys", "-t", resolved, "C-m");
+  } finally {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Already removed
+    }
+  }
   clearRead(paneId);
 }
 

@@ -1,7 +1,5 @@
 # tmux-bridge-mcp
 
-**English** | [简体中文](README.zh-CN.md)
-
 ![tmux-bridge-mcp](docs/images/hero-banner.png)
 
 A standalone MCP server that lets AI agents (Claude Code, Gemini CLI, Codex, Kimi CLI) communicate with each other through tmux panes. It talks directly to tmux -- no external dependencies beyond tmux itself.
@@ -31,7 +29,7 @@ Each pane is a full terminal. You can have Claude Code running in one, Codex in 
 
 ![The Problem](docs/images/the-problem.png)
 
-**tmux-bridge fixes this.** It gives every agent the ability to read, type, and send messages into any other pane.
+**tmux-bridge fixes this.** It gives every agent the ability to read panes and send messages into any other agent pane.
 
 ![The Solution](docs/images/the-solution.png)
 
@@ -42,7 +40,7 @@ Once installed, your AI agents can:
 | Action | How | Example |
 |--------|-----|---------|
 | **See what another agent is doing** | `tmux_read` | Read the last 20 lines of Codex's pane |
-| **Send a task to another agent** | `tmux_message` + `tmux_keys` | Tell Claude to review a file |
+| **Send a task to another agent** | `tmux_message` | Tell Claude to review a file |
 | **Coordinate multi-agent workflows** | Chain tool calls | Gemini researches -> Claude implements -> Codex reviews |
 | **Monitor processes** | `tmux_read` on a shell pane | Watch build logs, test output, server status |
 | **Route by tmux window** | `tmux_read` / `tmux_message` | Address agents by canonical tmux window names like "training" or "lit-review" |
@@ -82,7 +80,7 @@ tmux-bridge works with **any agent that supports MCP over stdio**. If your agent
 
 When you run multiple AI agents in separate terminals, they work in isolation. You end up copy-pasting context between them, manually relaying questions and answers, or losing track of what each agent is doing.
 
-tmux-bridge solves this by giving every agent the ability to **read, type, and send messages into any other terminal pane** -- programmatically, through standard MCP tool calls.
+tmux-bridge solves this by giving every agent the ability to **read panes and send messages into any other agent pane** -- programmatically, through standard MCP tool calls.
 
 **Use cases:**
 
@@ -223,12 +221,11 @@ All cross-pane interactions follow the **read-act-read** workflow:
 | Step | Action | Purpose |
 |------|--------|---------|
 | 1 | `tmux_read` | Read target pane (satisfies read guard) |
-| 2 | `tmux_message` / `tmux_type` | Type your message or command |
-| 3 | `tmux_read` | Verify text landed correctly |
-| 4 | `tmux_keys` | Press Enter to submit |
+| 2 | `tmux_message` | Send and submit the message |
+| 3 | `tmux_read` | Verify message was submitted |
 | -- | STOP | Don't poll. The other agent replies directly into your pane. |
 
-The read guard is enforced at the MCP layer: `tmux_type`, `tmux_message`, and `tmux_keys` will fail unless you call `tmux_read` on the target pane first.
+The read guard is enforced at the MCP layer: `tmux_message` will fail unless you call `tmux_read` on the target pane first.
 
 ## ⚙️ Setup Per Agent
 
@@ -307,17 +304,14 @@ kimi-tmux --rounds 3 "send a message to gemini and wait for the result"
 
 | Tool | Description |
 |------|-------------|
-| `tmux_list` | List all panes with target ID, process, label, and working directory |
+| `tmux_list` | List all panes with target ID, process, window, and working directory |
 | `tmux_read` | Read last N lines from a pane (satisfies read guard) |
-| `tmux_type` | Type text into a pane without pressing Enter (requires prior read) |
-| `tmux_message` | Send message with auto-prepended sender info (requires prior read) |
-| `tmux_keys` | Send special keys -- Enter, Escape, C-c, etc. (requires prior read) |
-| `tmux_name` | Set a legacy pane label for easy targeting (e.g., "claude", "gemini") |
-| `tmux_resolve` | Look up pane ID by tmux window name or legacy label |
+| `tmux_message` | Send and submit message with auto-prepended sender info (requires prior read) |
+| `tmux_resolve` | Look up pane ID by tmux window name |
 | `tmux_id` | Print current pane's tmux ID |
 | `tmux_doctor` | Diagnose tmux connectivity issues |
 
-Targets can be a pane ID (`%0`), session:window.pane (`main:0.1`), a tmux window name (`lit-review`), or a legacy pane label (`claude`). Non-explicit names resolve globally by `#{window_name}` first, then `@name` labels. Duplicate grouped-session views are collapsed by `#{pane_id}`; multiple real panes with the same name return an ambiguity error with candidates.
+Targets can be a pane ID (`%0`), session:window.pane (`main:0.1`), or a tmux window name (`lit-review`). Non-explicit names resolve globally by `#{window_name}`. Duplicate grouped-session views are collapsed by `#{pane_id}`; multiple real panes with the same name return an ambiguity error with candidates.
 
 ## 📖 Examples
 
@@ -328,7 +322,6 @@ tmux_list()
 tmux_read(target="claude", lines=20)
 tmux_message(target="claude", text="Please review src/auth.ts for security issues")
 tmux_read(target="claude", lines=5)
-tmux_keys(target="claude", keys=["Enter"])
 ```
 
 ### Multi-agent coordination (from Kimi)
@@ -348,7 +341,7 @@ kimi-tmux "ask gemini to summarize the test results in claude's pane"
 | | Claude Code | |   Codex    | | Gemini   | |   Kimi    | |
 | |  (MCP)     | |  (MCP)     | |  (MCP)   | |(kimi-tmux)| |
 | |            | |            | |          | |           |  |
-| | label:     | | label:     | | label:   | | label:    |  |
+| | window:    | | window:    | | window:  | | window:   |  |
 | | claude     | | codex      | | gemini   | | kimi      |  |
 | +-----+------+ +-----+------+ +----+-----+ +-----+-----+ |
 |       +---------------+-----------+--------------+        |
@@ -368,40 +361,21 @@ kimi-tmux "ask gemini to summarize the test results in claude's pane"
 tmux-bridge is designed for **local development on a single machine**. It assumes all connected MCP agents are trusted:
 
 - Any agent can read from or write to **any pane** in the tmux server — there is no per-pane access control.
-- The **read guard** (must `tmux_read` before `tmux_type`/`tmux_keys`) is a sequencing aid to prevent blind typing. It is **not a security boundary**.
-- Pane labels set via `tmux_name` are **not authenticated** — any agent can label or relabel any pane.
+- The **read guard** (must `tmux_read` before `tmux_message`) is a sequencing aid to prevent blind messaging. It is **not a security boundary**.
 - There is no encryption or authentication between agents. Communication happens through tmux's own IPC (Unix socket).
 
 **Do not use tmux-bridge in multi-tenant environments** or expose the tmux socket over a network. It is built for the common case: one developer running multiple AI agents side by side on their own machine.
 
 ## 📝 System Instruction
 
-For agents that support custom system prompts, use `system-instruction/smux-skill.md`. It teaches the read-act-read workflow and documents all available MCP tools.
+For agents that support custom system prompts, use `system-instruction/tmux-bridge-skill.md`. It teaches the read-act-read workflow and documents all available MCP tools.
 
 ## 🔗 Related Projects
 
 | Project | Approach | Focus |
 |---------|----------|-------|
-| [smux](https://github.com/ShawnPana/smux) | tmux skill + bash CLI | Agent-agnostic tmux setup |
 | [agent-bridge](https://github.com/raysonmeng/agent-bridge) | WebSocket daemon + MCP plugin | Claude Code <-> Codex |
 | **tmux-bridge-mcp** (this) | Standalone MCP server + direct tmux | Any agent, zero deps beyond tmux |
-
-### smux vs tmux-bridge-mcp
-
-| Dimension | smux | tmux-bridge-mcp (this) |
-|-----------|------|------------------------|
-| 🔌 **How agents connect** | Agent runs bash commands (`tmux-bridge read/type/keys`) | Agent uses MCP tool calls (`tmux_read/tmux_type/tmux_keys`) |
-| 🚀 **Agent onboarding** | Install skill or inject system prompt to teach bash commands | Add MCP config JSON -- agent auto-discovers 9 tools |
-| 📦 **Prerequisites** | `curl \| bash` installs tmux + tmux.conf + CLI script | Just tmux + Node.js, `npx` to run |
-| ⚙️ **tmux configuration** | Ships full tmux.conf (keybindings, mouse, status bar) | Doesn't touch tmux.conf -- no config conflicts |
-| 🛡️ **Read guard** | Bash CLI layer (`/tmp` file lock) | MCP server layer (`/tmp` file lock, same concept) |
-| 💻 **Language** | Bash (~300 LOC) | TypeScript (~600 LOC) |
-| 📥 **Install** | `curl \| bash`, writes to `~/.smux/` | `npm install -g` or `npx` |
-| 🤝 **Agent compatibility** | Any agent that can run bash (needs skill/prompt) | Any agent with MCP support (standard protocol) |
-
-👉 **When to use smux:** You want a complete tmux setup (keybindings, mouse support, status bar) and your agents support the skills system or you're comfortable injecting system prompts.
-
-👉 **When to use tmux-bridge-mcp:** You want a drop-in MCP server that works with any MCP-compatible agent out of the box, without touching your tmux configuration.
 
 ### tmux-bridge (`/tmb`) vs Claude Code Native (subagent + `/codex` + `/gemini`)
 
