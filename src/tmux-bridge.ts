@@ -88,6 +88,10 @@ async function tmuxNoFail(...args: string[]): Promise<string> {
   }
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function writeTempText(prefix: string, text: string): string {
   const path = join(tmpdir(), `${prefix}-${randomUUID()}`);
   writeFileSync(path, text);
@@ -484,7 +488,8 @@ export async function message(
       "-t",
       resolved,
     );
-    await tmux("send-keys", "-t", resolved, "C-m");
+    await sleep(150);
+    await tmux("send-keys", "-t", resolved, "Enter");
   } finally {
     try {
       unlinkSync(tmpPath);

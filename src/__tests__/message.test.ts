@@ -65,7 +65,7 @@ describe("message", () => {
     );
   });
 
-  it("pastes the message and submits it with carriage return", async () => {
+  it("pastes the message and submits it with Enter", async () => {
     markRead("%99");
 
     await message("%99", "hello teammate");
@@ -92,7 +92,7 @@ describe("message", () => {
       "send-keys",
       "-t",
       "%99",
-      "C-m",
+      "Enter",
     ].join("\0")))).toBe(true);
   });
 });
