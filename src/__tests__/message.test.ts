@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   execFile: vi.fn(),
@@ -34,6 +34,7 @@ describe("message", () => {
     delete process.env.TMUX_PANE;
     delete process.env.TMUX;
     delete process.env.TMUX_BRIDGE_SOCKET;
+    process.env.TMUX_BRIDGE_SUBMIT_DELAY_MS = "0";
     clearRead("%99");
     mocks.execFile.mockReset();
     mocks.execFile.mockImplementation(
@@ -63,6 +64,10 @@ describe("message", () => {
         callback(null, "", "");
       }
     );
+  });
+
+  afterEach(() => {
+    delete process.env.TMUX_BRIDGE_SUBMIT_DELAY_MS;
   });
 
   it("pastes the message and submits it with Enter", async () => {

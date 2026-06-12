@@ -92,6 +92,18 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function messageSubmitDelayMs(text: string): number {
+  const override = process.env.TMUX_BRIDGE_SUBMIT_DELAY_MS;
+  if (override) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+
+  // Agent TUIs process bracketed paste asynchronously. A fixed tiny delay can
+  // let Enter arrive before a long paste has been fully staged.
+  return Math.min(2500, Math.max(300, Math.ceil(text.length / 4)));
+}
+
 function writeTempText(prefix: string, text: string): string {
   const path = join(tmpdir(), `${prefix}-${randomUUID()}`);
   writeFileSync(path, text);
@@ -476,7 +488,8 @@ export async function message(
   const correlationId = randomUUID().slice(0, 8);
   const header = `[tmux-bridge from:${from} pane:${paneForHeader} id:${correlationId}]`;
   const bufferName = `tmux-bridge-${correlationId}`;
-  const tmpPath = writeTempText("tmux-bridge-message", `${header} ${text}`);
+  const payload = `${header} ${text}`;
+  const tmpPath = writeTempText("tmux-bridge-message", payload);
 
   try {
     await tmux("load-buffer", "-b", bufferName, tmpPath);
@@ -488,7 +501,7 @@ export async function message(
       "-t",
       resolved,
     );
-    await sleep(150);
+    await sleep(messageSubmitDelayMs(payload));
     await tmux("send-keys", "-t", resolved, "Enter");
   } finally {
     try {
