@@ -458,10 +458,21 @@ export async function type(target: string, text: string): Promise<void> {
   clearRead(paneId);
 }
 
+export interface MessageOptions {
+  /**
+   * Override the sender shown in the message header. Used by non-pane callers
+   * (e.g. the HTTP transport, where there is no self pane) so the receiving
+   * agent can tell an instruction came from off-machine.
+   */
+  from?: string;
+}
+
+/** Returns the correlation id embedded in the message header. */
 export async function message(
   target: string,
-  text: string
-): Promise<void> {
+  text: string,
+  opts: MessageOptions = {}
+): Promise<string> {
   const resolved = await resolveTarget(target);
   await validateTarget(resolved);
   const paneId = await getPaneId(resolved);
@@ -483,7 +494,8 @@ export async function message(
     ? await tmuxNoFail("display-message", "-t", senderPane, "-p", "#{@name}")
     : "";
   const paneForHeader = senderPane || "unknown";
-  const from = senderName.trim() || senderLabel.trim() || paneForHeader;
+  const from =
+    opts.from?.trim() || senderName.trim() || senderLabel.trim() || paneForHeader;
 
   const correlationId = randomUUID().slice(0, 8);
   const header = `[tmux-bridge from:${from} pane:${paneForHeader} id:${correlationId}]`;
@@ -511,6 +523,7 @@ export async function message(
     }
   }
   clearRead(paneId);
+  return correlationId;
 }
 
 export async function keys(
