@@ -3,7 +3,7 @@
  * output quality: which panes may be asked, and what counts as the agent's answer.
  */
 import { describe, it, expect } from "vitest";
-import { classifyPanes, cleanReply, type Target } from "../http.js";
+import { classifyPanes, cleanReply, findAgentForPane, parseProcTable, type Target } from "../http.js";
 import type { PaneInfo } from "../tmux-bridge.js";
 
 const pane = (over: Partial<PaneInfo>): PaneInfo => ({
@@ -89,5 +89,54 @@ describe("cleanReply", () => {
   it("stops at the prompt rather than swallowing later input", () => {
     const captured = ["", "⏺ Answer.", "", "❯ some text the user typed after", "  3% context"].join("\n");
     expect(cleanReply(captured)).toBe("Answer.");
+  });
+});
+
+describe("findAgentForPane", () => {
+  const rows = (spec: Array<[string, string, string]>) =>
+    parseProcTable(spec.map(([pid, ppid, cmd]) => `${pid} ${ppid} ${cmd}`).join("\n"));
+
+  it("finds an agent running as a child of the pane's shell", () => {
+    // The normal case: pane_pid is the shell, the agent is its child.
+    const t = rows([
+      ["100", "1", "/bin/zsh"],
+      ["200", "100", "/Users/oded/.local/bin/claude"],
+    ]);
+    expect(findAgentForPane("100", t, ["claude"])).toBe("claude");
+  });
+
+  it("matches the versioned binary path, whose basename is a version number", () => {
+    // Claude Code lives at .../share/claude/versions/2.1.220 — basename is "2.1.220".
+    const t = rows([["21071", "2735", "/Users/oded/.local/share/claude/versions/2.1.220"]]);
+    expect(findAgentForPane("21071", t, ["claude"])).toBe("claude");
+  });
+
+  it("returns the shell when the pane really is just a shell", () => {
+    const t = rows([
+      ["100", "1", "/bin/zsh"],
+      ["200", "100", "/usr/bin/vim"],
+    ]);
+    expect(findAgentForPane("100", t, ["claude", "codex"])).toBe("zsh");
+  });
+
+  it("ignores non-agent siblings and finds the agent", () => {
+    const t = rows([
+      ["1", "0", "/bin/zsh"],
+      ["2", "1", "/usr/bin/caffeinate"],
+      ["3", "1", "npm exec chrome-devtools-mcp@latest"],
+      ["4", "1", "/Users/oded/.local/bin/codex"],
+    ]);
+    expect(findAgentForPane("1", t, ["claude", "codex"])).toBe("codex");
+  });
+
+  it("stops descending past maxDepth", () => {
+    const t = rows([
+      ["1", "0", "/bin/zsh"],
+      ["2", "1", "/bin/zsh"],
+      ["3", "2", "/bin/zsh"],
+      ["4", "3", "/bin/claude"],
+    ]);
+    expect(findAgentForPane("1", t, ["claude"], 1)).toBe("zsh");
+    expect(findAgentForPane("1", t, ["claude"], 3)).toBe("claude");
   });
 });

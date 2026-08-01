@@ -111,7 +111,10 @@ export function cleanReply(afterMarker: string): string {
 export interface ProcRow {
   pid: string;
   ppid: string;
+  /** Basename, for display. */
   comm: string;
+  /** Full command as ps reported it — agent matching uses this. */
+  raw: string;
 }
 
 export function parseProcTable(psOutput: string): ProcRow[] {
@@ -119,8 +122,9 @@ export function parseProcTable(psOutput: string): ProcRow[] {
   for (const line of psOutput.split("\n")) {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
     if (!m) continue;
-    const comm = (m[3].trim().split("/").pop() || m[3].trim()).replace(/^-/, "");
-    rows.push({ pid: m[1], ppid: m[2], comm });
+    const raw = m[3].trim();
+    const comm = (raw.split("/").pop() || raw).replace(/^-/, "");
+    rows.push({ pid: m[1], ppid: m[2], comm, raw });
   }
   return rows;
 }
@@ -150,15 +154,19 @@ export function findAgentForPane(
     if (list) list.push(r);
     else children.set(r.ppid, [r]);
   }
-  const isAgent = (comm: string) =>
-    agentProcesses.some((a) => comm.toLowerCase().includes(a.toLowerCase()));
+  const isAgent = (row: ProcRow) =>
+    agentProcesses.some((a) => `${row.raw} ${row.comm}`.toLowerCase().includes(a.toLowerCase()));
 
   let frontier = [panePid];
   for (let depth = 0; depth <= maxDepth && frontier.length; depth++) {
     const next: string[] = [];
     for (const pid of frontier) {
       const row = byPid.get(pid);
-      if (row && isAgent(row.comm)) return row.comm;
+      // Report the matched agent name rather than the versioned basename.
+      if (row && isAgent(row))
+        return agentProcesses.find((a) =>
+          `${row.raw} ${row.comm}`.toLowerCase().includes(a.toLowerCase())
+        ) ?? row.comm;
       for (const child of children.get(pid) ?? []) next.push(child.pid);
     }
     frontier = next;
@@ -378,9 +386,18 @@ export function createHttpServer(options: Partial<HttpOptions> = {}) {
         }
 
         const targets = await currentTargets(opts);
-        const match = targets.find(
-          (t) => t.name === body.target || t.target === body.target
-        );
+        // A pane id is unambiguous; a window name may not be. Refuse rather than guess,
+        // since guessing means delivering an instruction to the wrong agent.
+        const byId = targets.find((t) => t.target === body.target);
+        const byName = targets.filter((t) => t.name === body.target);
+        if (!byId && byName.length > 1) {
+          return json(res, 409, {
+            error: `target "${body.target}" is ambiguous — ${byName.length} panes share that window name`,
+            candidates: byName.map((t) => ({ target: t.target, cwd: t.cwd, askable: t.askable })),
+            hint: "ask by pane id instead",
+          });
+        }
+        const match = byId ?? byName[0];
         if (!match) {
           return json(res, 404, {
             error: `no such target "${body.target}"`,
