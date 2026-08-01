@@ -107,40 +107,79 @@ export function cleanReply(afterMarker: string): string {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/** One row of the process table, as `ps -axo pid=,ppid=,comm=` gives it. */
+export interface ProcRow {
+  pid: string;
+  ppid: string;
+  comm: string;
+}
+
+export function parseProcTable(psOutput: string): ProcRow[] {
+  const rows: ProcRow[] = [];
+  for (const line of psOutput.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const comm = (m[3].trim().split("/").pop() || m[3].trim()).replace(/^-/, "");
+    rows.push({ pid: m[1], ppid: m[2], comm });
+  }
+  return rows;
+}
+
 /**
- * Map pane id -> the real command name of the pane's process.
+ * Find the agent a pane is running, given the pane's own pid.
  *
- * tmux's `pane_current_command` is not trustworthy for this: Claude Code sets its
- * process title to its version string, so a live agent pane reports something like
- * "2.1.220". Resolving pane_pid through ps gives the actual comm ("claude").
+ * Two things make the obvious lookups wrong:
+ *   - `pane_current_command` reports Claude Code's *version* ("2.1.220"), because it
+ *     sets its process title.
+ *   - `pane_pid` is usually the pane's shell, with the agent running as a child of it.
+ *     It is only the agent itself when the pane was launched with the agent as its
+ *     command.
+ * So we walk the pane pid's descendants and return the first process whose comm looks
+ * like a known agent; failing that, the pane's own comm.
  */
-async function paneCommands(): Promise<Map<string, string>> {
+export function findAgentForPane(
+  panePid: string,
+  rows: ProcRow[],
+  agentProcesses: string[],
+  maxDepth = 4
+): string | undefined {
+  const byPid = new Map(rows.map((r) => [r.pid, r]));
+  const children = new Map<string, ProcRow[]>();
+  for (const r of rows) {
+    const list = children.get(r.ppid);
+    if (list) list.push(r);
+    else children.set(r.ppid, [r]);
+  }
+  const isAgent = (comm: string) =>
+    agentProcesses.some((a) => comm.toLowerCase().includes(a.toLowerCase()));
+
+  let frontier = [panePid];
+  for (let depth = 0; depth <= maxDepth && frontier.length; depth++) {
+    const next: string[] = [];
+    for (const pid of frontier) {
+      const row = byPid.get(pid);
+      if (row && isAgent(row.comm)) return row.comm;
+      for (const child of children.get(pid) ?? []) next.push(child.pid);
+    }
+    frontier = next;
+  }
+  return byPid.get(panePid)?.comm;
+}
+
+/** Map pane id -> the command actually running in it (agent if one is found). */
+async function paneCommands(agentProcesses: string[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   try {
-    const { stdout } = await execFileAsync(
-      "tmux",
-      ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"],
-      { timeout: 5000 }
-    );
-    const pids: Array<[string, string]> = stdout
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => l.split("\t") as [string, string]);
-    if (!pids.length) return out;
-
-    const { stdout: psOut } = await execFileAsync(
-      "ps",
-      ["-o", "pid=,comm=", "-p", pids.map(([, pid]) => pid).join(",")],
-      { timeout: 5000 }
-    );
-    const byPid = new Map<string, string>();
-    for (const line of psOut.trim().split("\n")) {
-      const m = line.trim().match(/^(\d+)\s+(.*)$/);
-      if (m) byPid.set(m[1], (m[2].split("/").pop() || m[2]).trim());
-    }
-    for (const [paneId, pid] of pids) {
-      const comm = byPid.get(pid);
+    const [{ stdout: panesOut }, { stdout: psOut }] = await Promise.all([
+      execFileAsync("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"], {
+        timeout: 5000,
+      }),
+      execFileAsync("ps", ["-axo", "pid=,ppid=,comm="], { timeout: 8000, maxBuffer: 8 * 1024 * 1024 }),
+    ]);
+    const rows = parseProcTable(psOut);
+    for (const line of panesOut.trim().split("\n").filter(Boolean)) {
+      const [paneId, panePid] = line.split("\t");
+      const comm = findAgentForPane(panePid, rows, agentProcesses);
       if (comm) out.set(paneId, comm);
     }
   } catch {
@@ -175,7 +214,10 @@ export function classifyPanes(
 }
 
 async function currentTargets(opts: HttpOptions): Promise<Target[]> {
-  const [panes, commands] = await Promise.all([bridge.list(), paneCommands()]);
+  const [panes, commands] = await Promise.all([
+    bridge.list(),
+    paneCommands(opts.agentProcesses),
+  ]);
   return classifyPanes(panes, opts.agentProcesses, commands);
 }
 
