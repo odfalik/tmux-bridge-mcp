@@ -40,6 +40,12 @@ export interface HttpOptions {
   agentProcesses: string[];
   /** Sender shown to the receiving agent, so it can see the request came from off-machine. */
   senderLabel: string;
+  /**
+   * Prepended to pane asks. Without it agents try to tmux_message a reply back and
+   * find no sender pane, because the caller is off-machine — wasted turns and a
+   * confused answer. The bridge reads their pane, so they should just answer there.
+   */
+  askPreamble: string;
   /** Command used for headless asks (no target). */
   headlessCommand: string;
   defaultTimeoutMs: number;
@@ -54,6 +60,11 @@ export const DEFAULT_OPTIONS: HttpOptions = {
     .map((s) => s.trim())
     .filter(Boolean),
   senderLabel: process.env.TMUX_BRIDGE_SENDER_LABEL || "qm-personal (cloud)",
+  askPreamble:
+    process.env.TMUX_BRIDGE_ASK_PREAMBLE ??
+    "[Answer in this pane — the bridge reads your output. There is no sender pane to " +
+      "message back, so do not try to route a reply. Be brief and do not start new work " +
+      "unless asked.]",
   headlessCommand: process.env.TMUX_BRIDGE_HEADLESS_CMD || "claude",
   defaultTimeoutMs: Number(process.env.TMUX_BRIDGE_TIMEOUT_MS || 120_000),
 };
@@ -278,7 +289,8 @@ async function askPane(
   timeoutMs: number
 ): Promise<{ correlationId: string; reply: string; timedOut: boolean }> {
   await bridge.read(target, 5); // satisfies the read guard, server-side
-  const correlationId = await bridge.message(target, text, { from: opts.senderLabel });
+  const payload = opts.askPreamble ? `${opts.askPreamble}\n\n${text}` : text;
+  const correlationId = await bridge.message(target, payload, { from: opts.senderLabel });
 
   const deadline = Date.now() + timeoutMs;
   const marker = `id:${correlationId}`;
