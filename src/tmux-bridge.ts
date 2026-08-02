@@ -12,6 +12,49 @@ import { join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
+// --- Typed failures ---
+// Over stdio every failure is just text, so plain Errors were enough. The HTTP
+// transport has to turn the same failures into status codes, and sniffing error
+// strings to do that is how the two surfaces drift. The messages are unchanged —
+// only the type is new.
+
+/** A window name matched more than one live pane. Refuse rather than guess. */
+export class AmbiguousTargetError extends Error {
+  constructor(
+    message: string,
+    readonly target: string,
+    /** Pane IDs the name matched, so the caller can pick one. */
+    readonly candidates: string[]
+  ) {
+    super(message);
+    this.name = "AmbiguousTargetError";
+  }
+}
+
+/** No live pane matches the target. */
+export class TargetNotFoundError extends Error {
+  constructor(message: string, readonly target: string) {
+    super(message);
+    this.name = "TargetNotFoundError";
+  }
+}
+
+/** Refused because the target is the caller's own pane. */
+export class LoopPreventionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LoopPreventionError";
+  }
+}
+
+/** Refused because the pane was not read first. */
+export class ReadGuardError extends Error {
+  constructor(message: string, readonly paneId: string) {
+    super(message);
+    this.name = "ReadGuardError";
+  }
+}
+
 // --- Read Guard ---
 // Enforces read-before-act: agents must read a pane before typing/keys.
 
@@ -34,8 +77,9 @@ export function markRead(paneId: string): void {
 
 export function requireRead(paneId: string): void {
   if (!existsSync(guardPath(paneId))) {
-    throw new Error(
-      `Must read pane ${paneId} before interacting. Call tmux_read first.`
+    throw new ReadGuardError(
+      `Must read pane ${paneId} before interacting. Call tmux_read first.`,
+      paneId
     );
   }
 }
@@ -205,13 +249,18 @@ export function resolvePaneFromRecords(
     if (matches.length === 1) return matches[0].paneId;
     if (matches.length > 1) {
       const candidates = matches.map(candidateLine).join("\n");
-      throw new Error(
-        `Ambiguous tmux ${name} '${target}' matched multiple live panes:\n${candidates}`
+      throw new AmbiguousTargetError(
+        `Ambiguous tmux ${name} '${target}' matched multiple live panes:\n${candidates}`,
+        target,
+        matches.map((pane) => pane.paneId)
       );
     }
   }
 
-  throw new Error(`No live pane found with window name or label '${target}'`);
+  throw new TargetNotFoundError(
+    `No live pane found with window name or label '${target}'`,
+    target
+  );
 }
 
 async function listPaneRecords(): Promise<TmuxPaneRecord[]> {
@@ -228,7 +277,7 @@ async function validateTarget(target: string): Promise<void> {
   try {
     await tmux("display-message", "-t", target, "-p", "#{pane_id}");
   } catch {
-    throw new Error(`Invalid target: ${target}`);
+    throw new TargetNotFoundError(`Invalid target: ${target}`, target);
   }
 }
 
@@ -371,9 +420,11 @@ async function assertNotSelf(paneId: string, action: string): Promise<void> {
   const self = await detectSelfPaneNoFail();
   if (self && paneId === self) {
     if (action === "message") {
-      throw new Error("Cannot send message to your own pane (loop prevention)");
+      throw new LoopPreventionError(
+        "Cannot send message to your own pane (loop prevention)"
+      );
     }
-    throw new Error("Cannot interact with your own pane");
+    throw new LoopPreventionError("Cannot interact with your own pane");
   }
 }
 
@@ -550,6 +601,20 @@ export async function name(target: string, label: string): Promise<void> {
 
 export async function resolve(label: string): Promise<string> {
   return resolveTarget(label);
+}
+
+/**
+ * Canonical pane ID (%N) for any accepted target form.
+ *
+ * `resolve` hands explicit targets back unchanged (`main:1.0` stays `main:1.0`), which
+ * is right for the tmux_resolve verb but useless as a key: the same pane reached by
+ * name, by session:window.pane and by ID must map to one identity. Callers that key
+ * state on a pane — the HTTP read guard above all — use this instead.
+ */
+export async function paneIdFor(target: string): Promise<string> {
+  const resolved = await resolveTarget(target);
+  await validateTarget(resolved);
+  return getPaneId(resolved);
 }
 
 export async function id(): Promise<string> {
