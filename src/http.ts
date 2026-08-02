@@ -1,28 +1,34 @@
 /**
- * HTTP transport for remote callers (e.g. a QM agent sandbox reaching in over Tailscale).
+ * HTTP transport — a 1:1 mirror of the MCP tool surface, for remote callers (e.g. a QM
+ * agent sandbox reaching in over Tailscale).
  *
- * This is deliberately NOT a REST mirror of the MCP tool surface. The MCP tools are a
- * local, pane-to-pane bus for agents that share a tmux server; a remote caller wants
- * intent ("ask this thing and give me the answer"), not transport primitives. So the six
- * low-level verbs collapse to three endpoints, and the pane-level operations stay
- * unreachable from the network:
+ *   GET  /list                        tmux_list
+ *   GET  /read?target=&lines=         tmux_read
+ *   POST /message  {target, text}     tmux_message
+ *   GET  /resolve?target=             tmux_resolve
+ *   GET  /id                          tmux_id
+ *   GET  /doctor                      tmux_doctor
  *
- *   GET  /health   liveness + tmux reachability
- *   GET  /targets  what can be asked, and what cannot
- *   POST /ask      ask a live agent pane, or run one headless
+ * Plus GET /health, which is *not* a mirrored verb: it is infrastructural liveness for
+ * monitoring and for checking the tag configuration, has no MCP counterpart, and claims
+ * none. It is the only route exempt from the tag check, so a monitor can reach it.
  *
- * Two safety properties fall out of that shape rather than from configuration:
+ * Every verb delegates to src/tools.ts, the same functions the stdio server calls, so
+ * the two transports cannot drift. This file adds only HTTP framing: parameter parsing,
+ * JSON bodies, and status codes for the failures that stdio reports as text.
  *
- *   1. /ask only accepts targets that /targets marked askable, and a pane is only
- *      askable when it is running a known agent binary. Sending text to a shell would
- *      execute it — here there is no endpoint that can reach a shell pane at all.
- *   2. The read-guard that tmux_message requires is enforced server-side, so a remote
- *      caller cannot skip it.
+ * The read guard is the one thing HTTP has to implement itself. tmux_message requires a
+ * prior tmux_read of the same pane — a safety property, not a formality: it forces a
+ * caller to look at what it is about to type into. Over stdio that state is a file the
+ * server process owns. HTTP has no session, so we keep it here, keyed by
+ * (caller address, pane ID) with a TTL, and consume it on a successful send exactly as
+ * the stdio guard is cleared after each message. Unsatisfied is 409, never a silent skip.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as bridge from "./tmux-bridge.js";
+import * as tools from "./tools.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -32,212 +38,84 @@ export interface HttpOptions {
   port: number;
   /**
    * Tailscale tag required of callers, e.g. "tag:qm-personal". When set, every request
-   * is checked with `tailscale whois`; a caller without the tag is refused. Layered
-   * under the tailnet ACL so an ACL mistake fails closed instead of open.
+   * except /health is checked with `tailscale whois`; a caller without the tag is
+   * refused. Layered under the tailnet ACL so an ACL mistake fails closed instead of open.
    */
   requireTag?: string;
-  /** pane_current_command values considered agents, and therefore askable. */
-  agentProcesses: string[];
-  /** Sender shown to the receiving agent, so it can see the request came from off-machine. */
-  senderLabel: string;
   /**
-   * Prepended to pane asks. Without it agents try to tmux_message a reply back and
-   * find no sender pane, because the caller is off-machine — wasted turns and a
-   * confused answer. The bridge reads their pane, so they should just answer there.
+   * Sender shown to the receiving agent. An HTTP caller has no pane of its own, so
+   * without this the message header would name the bridge process instead of whoever
+   * actually sent it.
    */
-  askPreamble: string;
-  /** Command used for headless asks (no target). */
-  headlessCommand: string;
-  defaultTimeoutMs: number;
+  senderLabel: string;
+  /** How long a GET /read keeps POST /message unlocked for that caller and pane. */
+  readGuardTtlMs: number;
 }
 
 export const DEFAULT_OPTIONS: HttpOptions = {
   host: process.env.TMUX_BRIDGE_HTTP_HOST || "127.0.0.1",
   port: Number(process.env.TMUX_BRIDGE_HTTP_PORT || 8787),
   requireTag: process.env.TMUX_BRIDGE_REQUIRE_TAG || undefined,
-  agentProcesses: (process.env.TMUX_BRIDGE_AGENT_PROCESSES || "claude,codex")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
   senderLabel: process.env.TMUX_BRIDGE_SENDER_LABEL || "qm-personal (cloud)",
-  askPreamble:
-    process.env.TMUX_BRIDGE_ASK_PREAMBLE ??
-    "[Answer in this pane — the bridge reads your output. There is no sender pane to " +
-      "message back, so do not try to route a reply. Be brief and do not start new work " +
-      "unless asked.]",
-  headlessCommand: process.env.TMUX_BRIDGE_HEADLESS_CMD || "claude",
-  defaultTimeoutMs: Number(process.env.TMUX_BRIDGE_TIMEOUT_MS || 120_000),
+  readGuardTtlMs: Number(process.env.TMUX_BRIDGE_READ_GUARD_TTL_MS || 5 * 60_000),
 };
 
-export interface Target {
-  name: string;
-  target: string;
-  kind: "tmux";
-  agent: string;
-  cwd: string;
-  askable: boolean;
-  /** Present when askable is false, so the caller learns why rather than guessing. */
-  reason?: string;
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** TUI furniture that is not part of an answer. */
-const CHROME = [
-  /^[\s─-╿]+$/, // box-drawing rules
-  /^\s*[❯>]\s/, // the input prompt
-  /\d+%\s*context/i,
-  /bypass permissions|shift\+tab|for agents|esc to interrupt/i,
-  /^\s*[✳✴✻✹✵·*]\s*\w+(?:ed|ing)?\s+for\s+\d+/i, // "Cogitated for 1s"
-  /^\s*⏺?\s*$/,
-];
-
 /**
- * Pull the agent's answer out of a pane capture.
+ * Per-caller read guard.
  *
- * The capture is a live TUI, so it carries rules, the prompt, spinner lines and a status
- * bar alongside the actual reply. We take everything after the correlated header and drop
- * anything that is recognisably furniture; what remains is what the agent said.
- */
-export function cleanReply(afterMarker: string): string {
-  const lines = afterMarker.split("\n");
-  const out: string[] = [];
-  for (const raw of lines) {
-    const line = raw.replace(/\s+$/, "");
-    if (!line.trim()) {
-      if (out.length) out.push("");
-      continue;
-    }
-    if (CHROME.some((re) => re.test(line))) {
-      // Chrome after we already have content means the answer has ended.
-      if (out.length) break;
-      continue;
-    }
-    out.push(line.replace(/^\s*⏺\s*/, "").trimEnd());
-  }
-  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-/** One row of the process table, as `ps -axo pid=,ppid=,comm=` gives it. */
-export interface ProcRow {
-  pid: string;
-  ppid: string;
-  /** Basename, for display. */
-  comm: string;
-  /** Full command as ps reported it — agent matching uses this. */
-  raw: string;
-}
-
-export function parseProcTable(psOutput: string): ProcRow[] {
-  const rows: ProcRow[] = [];
-  for (const line of psOutput.split("\n")) {
-    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
-    if (!m) continue;
-    const raw = m[3].trim();
-    const comm = (raw.split("/").pop() || raw).replace(/^-/, "");
-    rows.push({ pid: m[1], ppid: m[2], comm, raw });
-  }
-  return rows;
-}
-
-/**
- * Find the agent a pane is running, given the pane's own pid.
+ * Keyed on the pane ID rather than the target string, so reading a pane by window name
+ * and then messaging it by ID (or the reverse) is one grant, and so a name that has
+ * since moved to another pane does not carry the grant with it. Keyed on the caller too:
+ * one client's read must not unlock a send for everybody else on the tailnet.
  *
- * Two things make the obvious lookups wrong:
- *   - `pane_current_command` reports Claude Code's *version* ("2.1.220"), because it
- *     sets its process title.
- *   - `pane_pid` is usually the pane's shell, with the agent running as a child of it.
- *     It is only the agent itself when the pane was launched with the agent as its
- *     command.
- * So we walk the pane pid's descendants and return the first process whose comm looks
- * like a known agent; failing that, the pane's own comm.
+ * `now` is injectable purely so the TTL is testable without sleeping.
  */
-export function findAgentForPane(
-  panePid: string,
-  rows: ProcRow[],
-  agentProcesses: string[],
-  maxDepth = 4
-): string | undefined {
-  const byPid = new Map(rows.map((r) => [r.pid, r]));
-  const children = new Map<string, ProcRow[]>();
-  for (const r of rows) {
-    const list = children.get(r.ppid);
-    if (list) list.push(r);
-    else children.set(r.ppid, [r]);
-  }
-  const isAgent = (row: ProcRow) =>
-    agentProcesses.some((a) => `${row.raw} ${row.comm}`.toLowerCase().includes(a.toLowerCase()));
+export class ReadGuard {
+  private grants = new Map<string, number>();
 
-  let frontier = [panePid];
-  for (let depth = 0; depth <= maxDepth && frontier.length; depth++) {
-    const next: string[] = [];
-    for (const pid of frontier) {
-      const row = byPid.get(pid);
-      // Report the matched agent name rather than the versioned basename.
-      if (row && isAgent(row))
-        return agentProcesses.find((a) =>
-          `${row.raw} ${row.comm}`.toLowerCase().includes(a.toLowerCase())
-        ) ?? row.comm;
-      for (const child of children.get(pid) ?? []) next.push(child.pid);
+  constructor(private readonly ttlMs: number) {}
+
+  private static key(client: string, paneId: string): string {
+    return `${client} ${paneId}`;
+  }
+
+  /** Record that `client` has read `paneId`. */
+  mark(client: string, paneId: string, now: number = Date.now()): void {
+    this.prune(now);
+    this.grants.set(ReadGuard.key(client, paneId), now + this.ttlMs);
+  }
+
+  isSatisfied(client: string, paneId: string, now: number = Date.now()): boolean {
+    const expiresAt = this.grants.get(ReadGuard.key(client, paneId));
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= now) {
+      this.grants.delete(ReadGuard.key(client, paneId));
+      return false;
     }
-    frontier = next;
+    return true;
   }
-  return byPid.get(panePid)?.comm;
-}
 
-/** Map pane id -> the command actually running in it (agent if one is found). */
-async function paneCommands(agentProcesses: string[]): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  try {
-    const [{ stdout: panesOut }, { stdout: psOut }] = await Promise.all([
-      execFileAsync("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"], {
-        timeout: 5000,
-      }),
-      execFileAsync("ps", ["-axo", "pid=,ppid=,comm="], { timeout: 8000, maxBuffer: 8 * 1024 * 1024 }),
-    ]);
-    const rows = parseProcTable(psOut);
-    for (const line of panesOut.trim().split("\n").filter(Boolean)) {
-      const [paneId, panePid] = line.split("\t");
-      const comm = findAgentForPane(panePid, rows, agentProcesses);
-      if (comm) out.set(paneId, comm);
+  /** Spend the grant. Each message needs its own read, as it does over stdio. */
+  consume(client: string, paneId: string): void {
+    this.grants.delete(ReadGuard.key(client, paneId));
+  }
+
+  /** Drop expired grants. Cheap, and it runs on write, so the map cannot grow unbounded. */
+  prune(now: number = Date.now()): void {
+    for (const [key, expiresAt] of this.grants) {
+      if (expiresAt <= now) this.grants.delete(key);
     }
-  } catch {
-    // fall back to pane_current_command
   }
-  return out;
+
+  get size(): number {
+    return this.grants.size;
+  }
 }
 
-/**
- * A pane is askable only when it runs a known agent. Everything else — shells above
- * all — is listed but refused, because messaging a shell submits the text to it.
- */
-export function classifyPanes(
-  panes: bridge.PaneInfo[],
-  agentProcesses: string[],
-  commands: Map<string, string> = new Map()
-): Target[] {
-  return panes.map((p) => {
-    const resolved = commands.get(p.target) || p.process || "";
-    const agent = resolved.toLowerCase();
-    const isAgent = agentProcesses.some((a) => agent.includes(a.toLowerCase()));
-    return {
-      name: p.windowName || p.sessionWindow,
-      target: p.target,
-      kind: "tmux" as const,
-      agent: resolved || "?",
-      cwd: p.cwd,
-      askable: isAgent,
-      ...(isAgent ? {} : { reason: `process "${resolved}" is not a known agent` }),
-    };
-  });
-}
-
-async function currentTargets(opts: HttpOptions): Promise<Target[]> {
-  const [panes, commands] = await Promise.all([
-    bridge.list(),
-    paneCommands(opts.agentProcesses),
-  ]);
-  return classifyPanes(panes, opts.agentProcesses, commands);
+/** Normalised caller address — the identity the read guard is keyed on. */
+export function clientIdentity(req: IncomingMessage): string {
+  const addr = req.socket.remoteAddress || "unknown";
+  return addr.replace(/^::ffff:/, "").replace(/^\[|\]$/g, "");
 }
 
 /** Caller identity, via Tailscale. Returns null when it cannot be established. */
@@ -254,6 +132,9 @@ async function whoisTags(remoteAddr: string): Promise<string[] | null> {
   }
 }
 
+/** The caller sent something malformed — 400, not a server fault. */
+class BadRequestError extends Error {}
+
 function json(res: ServerResponse, code: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(code, {
@@ -268,7 +149,7 @@ async function readBody(req: IncomingMessage, limitBytes = 256 * 1024): Promise<
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > limitBytes) throw new Error("request body too large");
+    if (size > limitBytes) throw new BadRequestError("request body too large");
     chunks.push(chunk as Buffer);
   }
   if (!chunks.length) return {};
@@ -276,77 +157,57 @@ async function readBody(req: IncomingMessage, limitBytes = 256 * 1024): Promise<
 }
 
 /**
- * Send to a live agent pane and wait for its answer.
+ * Map a bridge failure onto a status code.
  *
- * The correlation id that `message` stamps into the header is what delimits the reply:
- * everything the pane prints after that marker is the response. Polling stops once the
- * pane has been quiet for a beat, so we return a settled answer rather than a partial one.
+ * The bridge throws typed errors for exactly the cases a remote caller has to tell
+ * apart, so this stays a lookup rather than string sniffing. Ambiguity carries the
+ * candidate pane IDs out with it: the caller has to pick, and it cannot pick blind.
  */
-async function askPane(
-  target: string,
-  text: string,
-  opts: HttpOptions,
-  timeoutMs: number
-): Promise<{ correlationId: string; reply: string; timedOut: boolean }> {
-  await bridge.read(target, 5); // satisfies the read guard, server-side
-  const payload = opts.askPreamble ? `${opts.askPreamble}\n\n${text}` : text;
-  const correlationId = await bridge.message(target, payload, { from: opts.senderLabel });
+export function failure(e: unknown): { status: number; body: Record<string, unknown> } {
+  const error = e instanceof Error ? e.message : String(e);
 
-  const deadline = Date.now() + timeoutMs;
-  const marker = `id:${correlationId}`;
-  let lastReply = "";
-  let stableFor = 0;
-
-  while (Date.now() < deadline) {
-    await sleep(1500);
-    const pane = await bridge.read(target, 400);
-    const idx = pane.lastIndexOf(marker);
-    if (idx === -1) continue;
-
-    // Everything after the header line that carries our id, minus the TUI furniture.
-    // The echoed prompt can wrap onto following lines, so skip until a blank line.
-    const after = pane.slice(idx);
-    const firstBlank = after.search(/\n\s*\n/);
-    const body = firstBlank === -1 ? "" : after.slice(firstBlank);
-    const reply = cleanReply(body);
-    if (!reply) continue;
-
-    if (reply === lastReply) {
-      stableFor += 1500;
-      if (stableFor >= 3000) return { correlationId, reply, timedOut: false };
-    } else {
-      lastReply = reply;
-      stableFor = 0;
-    }
+  // Malformed query parameter, oversized body, or unparseable JSON.
+  if (e instanceof BadRequestError || e instanceof SyntaxError) {
+    return { status: 400, body: { error } };
   }
-  return { correlationId, reply: lastReply, timedOut: true };
+  if (e instanceof bridge.AmbiguousTargetError) {
+    return {
+      status: 409,
+      body: {
+        error,
+        candidates: e.candidates,
+        hint: "retry with a pane ID (%N) — the bridge will not guess between panes",
+      },
+    };
+  }
+  if (e instanceof bridge.TargetNotFoundError) return { status: 404, body: { error } };
+  if (e instanceof bridge.LoopPreventionError) return { status: 403, body: { error } };
+  // Only reachable if the process-wide guard was cleared under us; the per-caller guard
+  // below answers first in the normal case.
+  if (e instanceof bridge.ReadGuardError) {
+    return { status: 409, body: { error, hint: "GET /read?target=... first" } };
+  }
+  return { status: 500, body: { error } };
 }
 
-/** Run a fresh headless agent. No pane, no polling, no correlation matching. */
-async function askHeadless(
-  text: string,
-  opts: HttpOptions,
-  timeoutMs: number
-): Promise<{ reply: string; timedOut: boolean }> {
-  try {
-    const { stdout } = await execFileAsync(opts.headlessCommand, ["-p", text], {
-      timeout: timeoutMs,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    return { reply: stdout.trim(), timedOut: false };
-  } catch (e) {
-    const err = e as { killed?: boolean; stdout?: string; message?: string };
-    if (err.killed) return { reply: (err.stdout || "").trim(), timedOut: true };
-    throw new Error(err.message || String(e));
+/** Positive-integer query parameter, or undefined when absent. Throws on garbage. */
+function intParam(raw: string | null, name: string): number | undefined {
+  if (raw === null || raw === "") return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new BadRequestError(`${name} must be a positive integer`);
   }
+  return value;
 }
 
 export function createHttpServer(options: Partial<HttpOptions> = {}) {
   const opts: HttpOptions = { ...DEFAULT_OPTIONS, ...options };
+  const guard = new ReadGuard(opts.readGuardTtlMs);
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const path = url.pathname.replace(/\/+$/, "") || "/";
+    const client = clientIdentity(req);
 
     try {
       if (opts.requireTag && path !== "/health") {
@@ -359,6 +220,7 @@ export function createHttpServer(options: Partial<HttpOptions> = {}) {
         }
       }
 
+      // Not an MCP verb — liveness only. See the file header.
       if (req.method === "GET" && path === "/health") {
         let tmuxOk = true;
         try {
@@ -373,71 +235,93 @@ export function createHttpServer(options: Partial<HttpOptions> = {}) {
         });
       }
 
-      if (req.method === "GET" && path === "/targets") {
-        const targets = await currentTargets(opts);
+      if (req.method === "GET" && path === "/list") {
+        const { panes, text } = await tools.list();
+        return json(res, 200, { panes, text });
+      }
+
+      if (req.method === "GET" && path === "/read") {
+        const target = url.searchParams.get("target");
+        if (!target) return json(res, 400, { error: "target is required" });
+        const lines = intParam(url.searchParams.get("lines"), "lines") ?? tools.DEFAULT_READ_LINES;
+
+        const { paneId, text } = await tools.read(target, lines);
+        // The read that unlocks POST /message for this caller and this pane.
+        guard.mark(client, paneId);
+        return json(res, 200, { target, paneId, lines, text });
+      }
+
+      if (req.method === "POST" && path === "/message") {
+        const body = (await readBody(req)) as { target?: unknown; text?: unknown };
+        if (typeof body.target !== "string" || !body.target) {
+          return json(res, 400, { error: "target is required" });
+        }
+        if (typeof body.text !== "string" || !body.text) {
+          return json(res, 400, { error: "text is required" });
+        }
+
+        // Resolve before the guard check so a window name and a pane ID are the same key.
+        const paneId = await bridge.paneIdFor(body.target);
+        if (!guard.isSatisfied(client, paneId)) {
+          return json(res, 409, {
+            error: `read guard: ${paneId} has not been read by this caller`,
+            hint: `GET /read?target=${encodeURIComponent(body.target)} first, then retry`,
+            ttlMs: opts.readGuardTtlMs,
+          });
+        }
+        // The bridge keeps its own process-wide guard file, which any caller's send
+        // clears. This caller's grant has just been checked — per caller and with a
+        // TTL, which is stricter — so re-arm the shared one rather than fail on it.
+        bridge.markRead(paneId);
+
+        const result = await tools.message(body.target, body.text, {
+          from: opts.senderLabel,
+        });
+        // Spent: the next message needs its own read, as over stdio.
+        guard.consume(client, result.paneId);
         return json(res, 200, {
-          targets,
-          headless: { kind: "headless", available: true, command: opts.headlessCommand },
+          target: body.target,
+          paneId: result.paneId,
+          correlationId: result.correlationId,
+          text: result.text,
         });
       }
 
-      if (req.method === "POST" && path === "/ask") {
-        const body = (await readBody(req)) as {
-          target?: string;
-          text?: string;
-          timeoutMs?: number;
-        };
-        if (!body.text || typeof body.text !== "string") {
-          return json(res, 400, { error: "text is required" });
-        }
-        const timeoutMs = Math.min(Math.max(body.timeoutMs ?? opts.defaultTimeoutMs, 1000), 600_000);
+      if (req.method === "GET" && path === "/resolve") {
+        const target = url.searchParams.get("target");
+        if (!target) return json(res, 400, { error: "target is required" });
+        const resolved = await tools.resolve(target);
+        return json(res, 200, { target, resolved, text: resolved });
+      }
 
-        if (!body.target) {
-          const out = await askHeadless(body.text, opts, timeoutMs);
-          return json(res, 200, { kind: "headless", ...out });
-        }
+      if (req.method === "GET" && path === "/id") {
+        const paneId = await tools.id();
+        return json(res, 200, { paneId, text: paneId });
+      }
 
-        const targets = await currentTargets(opts);
-        // A pane id is unambiguous; a window name may not be. Refuse rather than guess,
-        // since guessing means delivering an instruction to the wrong agent.
-        const byId = targets.find((t) => t.target === body.target);
-        const byName = targets.filter((t) => t.name === body.target);
-        if (!byId && byName.length > 1) {
-          return json(res, 409, {
-            error: `target "${body.target}" is ambiguous — ${byName.length} panes share that window name`,
-            candidates: byName.map((t) => ({ target: t.target, cwd: t.cwd, askable: t.askable })),
-            hint: "ask by pane id instead",
-          });
-        }
-        const match = byId ?? byName[0];
-        if (!match) {
-          return json(res, 404, {
-            error: `no such target "${body.target}"`,
-            askable: targets.filter((t) => t.askable).map((t) => t.name),
-          });
-        }
-        if (!match.askable) {
-          return json(res, 403, { error: `target "${body.target}" is not askable`, reason: match.reason });
-        }
-
-        const out = await askPane(match.target, body.text, opts, timeoutMs);
-        return json(res, 200, { kind: "tmux", target: match.name, ...out });
+      if (req.method === "GET" && path === "/doctor") {
+        const text = await tools.doctor();
+        return json(res, 200, { text });
       }
 
       return json(res, 404, { error: `no route for ${req.method} ${path}` });
     } catch (e) {
-      return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+      const { status, body } = failure(e);
+      return json(res, status, body);
     }
   });
 
   return {
     server,
     options: opts,
+    guard,
     listen: () =>
       new Promise<void>((resolve) => {
         server.listen(opts.port, opts.host, () => {
+          const address = server.address();
+          const port = typeof address === "object" && address ? address.port : opts.port;
           const tag = opts.requireTag ? ` requiring ${opts.requireTag}` : " (NO tag check)";
-          console.error(`tmux-bridge http on ${opts.host}:${opts.port}${tag}`);
+          console.error(`tmux-bridge http on ${opts.host}:${port}${tag}`);
           resolve();
         });
       }),

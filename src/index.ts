@@ -3,6 +3,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as bridge from "./tmux-bridge.js";
+// The verb implementations are shared with the HTTP transport (src/http.ts) so the two
+// surfaces cannot drift; this file only frames their output as MCP content.
+import * as tools from "./tools.js";
 
 const server = new McpServer({
   name: "tmux-bridge",
@@ -22,14 +25,8 @@ server.tool(
   {},
   async () => {
     try {
-      const panes = await bridge.list();
-      const text = panes
-        .map(
-          (p) =>
-            `${p.target} | ${p.sessionWindow} | window:${p.windowName || "(none)"} | ${p.process} | ${p.cwd}`
-        )
-        .join("\n");
-      return { content: [{ type: "text", text: text || "No panes found" }] };
+      const { text } = await tools.list();
+      return { content: [{ type: "text", text }] };
     } catch (e) {
       return err(e);
     }
@@ -44,13 +41,13 @@ server.tool(
     lines: z
       .number()
       .optional()
-      .default(50)
-      .describe("Number of lines to read (default 50)"),
+      .default(tools.DEFAULT_READ_LINES)
+      .describe(`Number of lines to read (default ${tools.DEFAULT_READ_LINES})`),
   },
   async ({ target, lines }) => {
     try {
-      const output = await bridge.read(target, lines);
-      return { content: [{ type: "text", text: output }] };
+      const { text } = await tools.read(target, lines);
+      return { content: [{ type: "text", text }] };
     } catch (e) {
       return err(e);
     }
@@ -66,10 +63,8 @@ server.tool(
   },
   async ({ target, text }) => {
     try {
-      await bridge.message(target, text);
-      return {
-        content: [{ type: "text", text: `Message sent and submitted to ${target}` }],
-      };
+      const result = await tools.message(target, text);
+      return { content: [{ type: "text", text: result.text }] };
     } catch (e) {
       return err(e);
     }
@@ -84,7 +79,7 @@ server.tool(
   },
   async ({ target }) => {
     try {
-      const paneId = await bridge.resolve(target);
+      const paneId = await tools.resolve(target);
       return { content: [{ type: "text", text: paneId }] };
     } catch (e) {
       return err(e);
@@ -98,7 +93,7 @@ server.tool(
   {},
   async () => {
     try {
-      const paneId = await bridge.id();
+      const paneId = await tools.id();
       return { content: [{ type: "text", text: paneId }] };
     } catch (e) {
       return err(e);
@@ -112,7 +107,7 @@ server.tool(
   {},
   async () => {
     try {
-      const output = await bridge.doctor();
+      const output = await tools.doctor();
       return { content: [{ type: "text", text: output }] };
     } catch (e) {
       return err(e);
